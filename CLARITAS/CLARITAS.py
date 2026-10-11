@@ -9,7 +9,8 @@ Sediment transport is stationary, not a transient settling simulation.
 Wavelength-dependent Mie efficiencies, per-bin phase functions, morphology
 coherence and internal absorption are recomputed. Refractive-index dispersion
 tables are not supplied: water, acrylic and particle n(d) remain fixed unless
-explicitly overridden. The configured particle imaginary index is zero.
+explicitly overridden. The configured particle imaginary index uses the stored exploratory k(d) arrays.
+These arrays are not measured spectral optical constants.
 Supplied comparison settings at 622 nm are distinct from the current defaults.
 
 The executing source SHA-256 is recorded in run_config.json and run_summary.json.
@@ -48,7 +49,7 @@ RUN_SWEEP = False
 MATERIAL = "loess"  # "loess" or "kaolin"
 CONCENTRATION_G_L = 0.5
 WAVELENGTH_NM = 622.0  # supplied comparison wavelength = 622 nm
-N_RAYS = 1_000_000
+N_RAYS = 10_000_000
 RANDOM_SEED = 24620001
 GPU_DEVICE = 0
 
@@ -143,10 +144,16 @@ WATER_REFRACTIVE_INDEX = 1.33
 ACRYLIC_REFRACTIVE_INDEX = 1.4906
 AIR_REFRACTIVE_INDEX = 1.0
 
-# The configured optical profile uses size-dependent n(d) and k=0.
-# Override only with an external optical basis.
+# The configured optical profile uses size-dependent n(d) and stored k(d).
+# Stored k(d) profiles are exploratory, not measured wavelength-dependent data.
 PARTICLE_N_REAL_OVERRIDE = None
-PARTICLE_K_IMAG_OVERRIDE = 0.0
+# None: select the stored k(d) array separately for each material (works in a sweep).
+# 0.0: disable particle absorption by setting every bin's k to zero.
+# Positive scalar: set the same k for every bin and every material.
+# Per-bin array: match PSD order and length (38 loess / 37 kaolin); run one material.
+# All modes use the same selected k values across wavelength sweeps. Use separate
+# runs with justified optical constants to represent wavelength-dependent k.
+PARTICLE_K_IMAG_OVERRIDE = None
 
 # Particle surface parameters.
 PARTICLE_SURFACE_RMS_SLOPE_DEG = 25.0
@@ -11071,8 +11078,8 @@ def _validate_material(material: str) -> str:
 def _optical_profile_override(material: str):
     """Resolve the built-in particle n(d) and configured imaginary index.
 
-    The current configuration sets k=0. Scalar or per-bin overrides are
-    applied explicitly; the exploratory stored k(d) profile is not substituted.
+    None selects the material's stored exploratory k(d) profile. Scalars and
+    per-bin arrays override it; zero gives nonabsorbing particles.
     """
     material = _validate_material(material)
     n, _k_source = get_material_optical_constants(material, None, 1.59)
@@ -11087,15 +11094,21 @@ def _optical_profile_override(material: str):
             raise ValueError(
                 f"PARTICLE_N_REAL_OVERRIDE must be scalar or contain {n.size} values for {material}"
             )
-    kq = np.asarray(PARTICLE_K_IMAG_OVERRIDE, dtype=np.float64)
-    if kq.ndim == 0:
-        k = np.full_like(n, float(kq))
-    elif kq.shape == n.shape:
-        k = kq.copy()
+    if PARTICLE_K_IMAG_OVERRIDE is None:
+        # Resolve per material so combined loess/kaolin sweeps use matching bins.
+        k = np.asarray(_k_source, dtype=np.float64).copy()
     else:
-        raise ValueError(
-            f"PARTICLE_K_IMAG_OVERRIDE must be scalar or contain {n.size} values for {material}"
-        )
+        kq = np.asarray(PARTICLE_K_IMAG_OVERRIDE, dtype=np.float64)
+        if kq.ndim == 0:
+            k = np.full_like(n, float(kq))
+        elif kq.shape == n.shape:
+            k = kq.copy()
+        else:
+            raise ValueError(
+                f"PARTICLE_K_IMAG_OVERRIDE must be scalar or contain {n.size} values for {material}"
+            )
+    if not np.all(np.isfinite(n)) or not np.all(np.isfinite(k)):
+        raise ValueError('particle n and k must be finite')
     if np.any(n <= 0) or np.any(k < 0):
         raise ValueError('particle n must be >0 and k must be >=0')
     return {material: {'n_real': n.tolist(), 'k_imag': k.tolist()}}, n, k
@@ -11190,7 +11203,11 @@ def _wavelength_assumption_summary(material: str, wavelength_nm: float, nvals, k
         'particle_k_min': float(np.min(kvals)),
         'particle_k_max': float(np.max(kvals)),
         'particle_index_basis': 'fixed size-dependent n(d); no spectral dispersion table',
-        'particle_k_basis': 'configured k=0 unless user overrides PARTICLE_K_IMAG_OVERRIDE',
+        'particle_k_basis': (
+            'stored exploratory per-bin k(d); fixed across wavelengths'
+            if PARTICLE_K_IMAG_OVERRIDE is None
+            else 'configured scalar or per-bin k override; fixed across wavelengths'
+        ),
         'medium_dispersion_basis': 'water/acrylic indices are user-configurable constants; no automatic spectral dispersion',
         'multiwavelength_status': 'wavelength-explicit physics recomputed; refractive-index dispersion assumed fixed unless overridden',
     }
@@ -13216,4 +13233,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
