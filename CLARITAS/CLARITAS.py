@@ -9,9 +9,17 @@ Sediment transport is stationary, not a transient settling simulation.
 Wavelength-dependent Mie efficiencies, per-bin phase functions, morphology
 coherence and internal absorption are recomputed. Refractive-index dispersion
 tables are not supplied: water, acrylic and particle n(d) remain fixed unless
-explicitly overridden. The configured particle imaginary index uses the stored exploratory k(d) arrays.
-These arrays are not measured spectral optical constants.
+explicitly overridden. The imaginary index is selected by PARTICLE_K_IMAG_OVERRIDE: zero disables
+particle absorption; None selects stored exploratory k(d) arrays. Those arrays
+are not measured spectral optical constants.
 Supplied comparison settings at 622 nm are distinct from the current defaults.
+
+The hybrid_mie_exact_rate models sample Mie extinction and terminal outcomes.
+Finite-particle geometric and morphology paths are conditioned on that outcome;
+coherent Mie scattering remains distinct. This is a hybrid physical closure,
+not an exact electromagnetic solution for rough particles. Integral Mie closure
+does not validate its angular distribution or absolute apparatus amplitude.
+Other selectable event models retain their configured unconditional semantics.
 
 The executing source SHA-256 is recorded in run_config.json and run_summary.json.
 """
@@ -56,7 +64,7 @@ GPU_DEVICE = 0
 # ---------------------------------------------------------------------------
 # SWEEP CONFIGURATION (used only when RUN_SWEEP=True)
 # ---------------------------------------------------------------------------
-MATERIALS = ["loess", "kaolin"]
+MATERIALS = ["loess"]
 CONCENTRATIONS_G_L = [0.5, 2.0, 4.0]
 WAVELENGTHS_NM = [622.0]
 USE_SAME_SEED_FOR_SWEEP = False  # False => deterministic seed offset per case
@@ -79,8 +87,13 @@ SEDIMENT_DISTRIBUTION = "steady_state"  # "uniform" or "steady_state"
 #   "schiller_naumann_drift_diffusion"                 (supplied comparison)
 #   "schiller_naumann_meridional_advection_diffusion"  (requires vortex)
 SEDIMENT_TRANSPORT_MODEL = "schiller_naumann_meridional_advection_diffusion"
-SEDIMENT_EDDY_DIFFUSIVITY_M2_S = 1.0e-3
-SEDIMENT_PARTICLE_DENSITY_KG_M3 = 2600.0
+#SEDIMENT_EDDY_DIFFUSIVITY_M2_S = 1.0e-3
+SEDIMENT_EDDY_DIFFUSIVITY_M2_S = 7.0e-4
+# True particle material density (not bulk suspension density). Values are
+# illustrative and should be replaced by measurements where available.
+# Legacy scalar configuration is also accepted for both materials.
+SEDIMENT_PARTICLE_DENSITY_KG_M3 = {"loess": 2650.0, "kaolin": 2600.0}
+#SEDIMENT_PARTICLE_DENSITY_KG_M3 = {"loess": 2000.0, "kaolin": 2600.0}
 WATER_DENSITY_KG_M3 = 997.0
 WATER_DYNAMIC_VISCOSITY_PA_S = 8.9e-4
 GRAVITY_M_S2 = 9.81
@@ -144,7 +157,7 @@ WATER_REFRACTIVE_INDEX = 1.33
 ACRYLIC_REFRACTIVE_INDEX = 1.4906
 AIR_REFRACTIVE_INDEX = 1.0
 
-# The configured optical profile uses size-dependent n(d) and stored k(d).
+# The real-index profile uses size-dependent n(d); k selection is below.
 # Stored k(d) profiles are exploratory, not measured wavelength-dependent data.
 PARTICLE_N_REAL_OVERRIDE = None
 # None: select the stored k(d) array separately for each material (works in a sweep).
@@ -153,7 +166,8 @@ PARTICLE_N_REAL_OVERRIDE = None
 # Per-bin array: match PSD order and length (38 loess / 37 kaolin); run one material.
 # All modes use the same selected k values across wavelength sweeps. Use separate
 # runs with justified optical constants to represent wavelength-dependent k.
-PARTICLE_K_IMAG_OVERRIDE = None
+#PARTICLE_K_IMAG_OVERRIDE = None
+PARTICLE_K_IMAG_OVERRIDE = 0.0
 
 # Particle surface parameters.
 PARTICLE_SURFACE_RMS_SLOPE_DEG = 25.0
@@ -182,7 +196,7 @@ SUMMARY_ANGLES_DEG = [0, 20, 90, 120, 140, 170]
 # count of sampled points.  The bounded ray subset keeps memory/runtime explicit.
 SAVE_LIGHT_TRANSPORT_VISUALISATIONS = True
 SAVE_LIGHT_TRANSPORT_DATA = True
-LIGHT_TRANSPORT_DIAGNOSTIC_MAX_RAYS = N_RAYS
+LIGHT_TRANSPORT_DIAGNOSTIC_MAX_RAYS = None  # None follows the current N_RAYS
 # Finer diagnostic cells: twice the resolution in each axis (8x grid memory).
 LIGHT_TRANSPORT_GRID_NX = 256
 LIGHT_TRANSPORT_GRID_NY = 256
@@ -448,6 +462,9 @@ PRODUCTION_WATCHDOG_CODES = frozenset((2, 4, 6, 8, 10))
 PRODUCTION_GEOMETRY_FAILURE_CODES = frozenset((3, 5, 7, 9, 13, 16, 17))
 PRODUCTION_NONFINITE_CODES = frozenset((11, 12))
 PRODUCTION_FAILURE_SUBCODE_NAMES = {
+    9001: 'CONDITIONAL_RETRY_EXHAUSTED',
+    9002: 'CONDITIONAL_INVALID_COEFFICIENTS',
+    9003: 'CONDITIONAL_OUTCOME_BELOW_RNG_RESOLUTION',
     0: 'NONE',
     10: 'VNDF_PROJECTED_AREA_INVALID',
     11: 'VNDF_CDF_INVALID',
@@ -1095,6 +1112,10 @@ def get_material_optical_constants(
     return n, k
 
 
+# Each extinction encounter has at most this many internal candidate trials.
+# Exhaustion is an explicit failed ray; it never forces the selected outcome.
+CONDITIONAL_MAX_TRIALS = 16384
+
 CUDA_SRC = r'''extern "C" {
 
 #define INF_F 3.402823466e+38F
@@ -1375,8 +1396,64 @@ __device__ cpx csqrtp(cpx z){
     return C(u,v);
 }
 
+// Local planar-interface complex-index energy-flux closure.
+// The ray represents a real energy-transport direction. For absorption in the
+// incident medium, its tangential phase wavevector cannot be reconstructed
+// uniquely from a geometrical ray; beta=n1_real*sin(theta) is the explicitly
+// retained local plane-wave approximation. No new stochastic material factor.
+__device__ int particle_complex_interface(
+    float ci,float n1r,float n1k,float n2r,float n2k,
+    float* reflected,float* tangential_energy,float* normal_energy){
+    if(!(n1r>0.f&&n2r>0.f&&n1k>=0.f&&n2k>=0.f))return 0;
+    ci=fminf(fmaxf(ci,0.f),1.f);
+    float beta=n1r*sqrtf(fmaxf(0.f,1.f-ci*ci));
+    cpx n1=C(n1r,n1k),n2=C(n2r,n2k);
+    cpx eps1=cmul(n1,n1),eps2=cmul(n2,n2);
+    cpx q1=csqrtp(csub(eps1,C(beta*beta,0.f)));
+    cpx q2=csqrtp(csub(eps2,C(beta*beta,0.f)));
+    cpx rs=cdiv(csub(q1,q2),cadd(q1,q2));
+    cpx rp=cdiv(csub(cmul(eps2,q1),cmul(eps1,q2)),
+                 cadd(cmul(eps2,q1),cmul(eps1,q2)));
+    float R=.5f*(cabs2(rs)+cabs2(rp));
+    if(!isfinite(R))return 0;
+    // TE: Poynting vector proportional to Re(k).
+    // TM: Poynting vector proportional to Re(k/epsilon).
+    cpx qeps=cdiv(q2,eps2),beps=cdiv(C(beta,0.f),eps2);
+    float sx=q2.re,sz=q2.re,tx=beta,tz=q2.re;
+    (void)sx;(void)sz;
+    float Sx=beta, Sz=q2.re, Px=beps.re, Pz=qeps.re;
+    float sn=hypotf(Sx,Sz),pn=hypotf(Px,Pz);
+    if(!(sn>0.f&&pn>0.f&&Sz>=0.f&&Pz>=0.f))return 0;
+    // Equally weighted incident s/p polarisations for directional bookkeeping.
+    // Each unit vector is an energy-flux direction, not a complex Snell angle.
+    float txe=.5f*(Sx/sn+Px/pn);
+    float tze=.5f*(Sz/sn+Pz/pn);
+    float nm=hypotf(txe,tze);
+    if(!(nm>0.f&&isfinite(nm)))return 0;
+    *reflected=fminf(fmaxf(R,0.f),1.f);
+    *tangential_energy=txe/nm;
+    *normal_energy=tze/nm;
+    return 1;
+}
+__device__ int particle_energy_refract3(
+    float ix,float iy,float iz,float nx,float ny,float nz,
+    float n1r,float n1k,float n2r,float n2k,
+    float* ox,float* oy,float* oz){
+    float ci=fminf(fmaxf(-dot3(ix,iy,iz,nx,ny,nz),0.f),1.f);
+    float R,ts,tn;
+    if(!particle_complex_interface(ci,n1r,n1k,n2r,n2k,&R,&ts,&tn))return 0;
+    float px=ix+ci*nx,py=iy+ci*ny,pz=iz+ci*nz;
+    float pn=sqrtf(px*px+py*py+pz*pz);
+    if(pn>1.e-7f){px/=pn;py/=pn;pz/=pn;}
+    else {px=py=pz=0.f;ts=0.f;tn=1.f;}
+    *ox=ts*px-tn*nx;*oy=ts*py-tn*ny;*oz=ts*pz-tn*nz;
+    normalize3(ox,oy,oz);
+    return isfinite(*ox)&&isfinite(*oy)&&isfinite(*oz);
+}
+
 // Unpolarised Fresnel reflectance with possibly complex incident/transmitted indices.
-// Geometry/direction still uses real phase indices separately.
+// The particle microsurface instead uses particle_complex_interface above; this
+// compatibility helper is retained for other callers.
 __device__ float fresnel_R_complex(float ci,float n1r,float n1k,float n2r,float n2k){
     ci=fminf(fmaxf(ci,0.0f),1.0f);
     float si2=fmaxf(0.0f,1.0f-ci*ci);
@@ -1834,6 +1911,14 @@ __device__ double beckmann_open_uniform(unsigned int* state){
     return ((double)r+0.5)*2.3283064365386962890625e-10; // 2^-32
 }
 
+// Particle-internal intensity attenuation; wavelength is the vacuum wavelength (m).
+__device__ float particle_internal_absorption_coefficient(float k,float wavelength){
+ return (wavelength>0.0f&&k>0.0f)?(4.0f*PI_F*k/wavelength):0.0f;
+}
+__device__ double sample_particle_absorption_distance(unsigned int* state,float alpha_abs){
+ return alpha_abs>0.0f?-log(beckmann_open_uniform(state))/(double)alpha_abs:positive_infinity_double();
+}
+
 // B(x)=1-x*sqrt(pi)*erfcx(x), x>=0.  For deep Beckmann backside incidence the
 // individual projected-area terms are exponentially tiny and nearly cancel.  Evaluating
 // their ratio through B avoids both erff(a)+1 cancellation and underflow.  The large-x
@@ -2251,17 +2336,17 @@ __device__ int smith_microsurface_dielectric_walk_ex(
     if(alpha<=1.0e-7f){
         float wi_x=-(*dx),wi_y=-(*dy),wi_z=-(*dz);
         float ci=fminf(fmaxf(dot3(wi_x,wi_y,wi_z,bx,by,bz),0.0f),1.0f);
-        float eta=n_top/n_bottom;
-        if(!(n_bottom>0.0f)||!isfinite(eta)){micro_set_failure(failure_code,REFRACTION_VECTOR_INVALID);return MICRO_NUMERICAL_FAILURE;}
-        int tir=(eta*eta*fmaxf(0.0f,1.0f-ci*ci)>=1.0f);
-        float R=tir?1.0f:fresnel_R_complex(ci,n_top,k_top,n_bottom,k_bottom);
+        float R,ts,tn;
+        if(!particle_complex_interface(ci,n_top,k_top,n_bottom,k_bottom,&R,&ts,&tn)){
+            micro_set_failure(failure_code,FRESNEL_INVALID);return MICRO_NUMERICAL_FAILURE;
+        }
         if(!isfinite(R)){micro_set_failure(failure_code,FRESNEL_INVALID);return MICRO_NUMERICAL_FAILURE;}
         float ox,oy,oz;
-        if(tir||rnd_uniform(state)<R){
+        if(rnd_uniform(state)<R){
             reflect3(*dx,*dy,*dz,bx,by,bz,&ox,&oy,&oz);*out_top=1;
             if(!isfinite(ox)||!isfinite(oy)||!isfinite(oz)){micro_set_failure(failure_code,REFLECTION_VECTOR_INVALID);return MICRO_NUMERICAL_FAILURE;}
         }else{
-            if(!refract3(*dx,*dy,*dz,bx,by,bz,n_top,n_bottom,&ox,&oy,&oz)){
+            if(!particle_energy_refract3(*dx,*dy,*dz,bx,by,bz,n_top,k_top,n_bottom,k_bottom,&ox,&oy,&oz)){
                 micro_set_failure(failure_code,REFRACTION_VECTOR_INVALID);return MICRO_NUMERICAL_FAILURE;
             }
             *out_top=0;
@@ -2308,23 +2393,27 @@ __device__ int smith_microsurface_dielectric_walk_ex(
         double ci_d=fmin(1.0,fmax(0.0,vis));float ci=(float)ci_d;
         float n1=outside?n_top:n_bottom,k1=outside?k_top:k_bottom,n2=outside?n_bottom:n_top,k2=outside?k_bottom:k_top;
         if(!(n1>0.0f&&n2>0.0f)){micro_set_failure(failure_code,REFRACTION_VECTOR_INVALID);return MICRO_NUMERICAL_FAILURE;}
-        double eta=(double)n1/(double)n2;double kt=1.0-eta*eta*fmax(0.0,1.0-ci_d*ci_d);int tir=(kt<=0.0);
-        float R=tir?1.0f:fresnel_R_complex(ci,n1,k1,n2,k2);
+        float R,ts,tn;
+        if(!particle_complex_interface(ci,n1,k1,n2,k2,&R,&ts,&tn)){
+            micro_set_failure(failure_code,FRESNEL_INVALID);return MICRO_NUMERICAL_FAILURE;
+        }
         if(!isfinite(R)){micro_set_failure(failure_code,FRESNEL_INVALID);return MICRO_NUMERICAL_FAILURE;}
         double ox_d,oy_d,oz_d;
-        if(tir||rnd_uniform(state)<R){
+        if(rnd_uniform(state)<R){
             double dd=(double)(*dx)*mx+(double)(*dy)*my+(double)(*dz)*mz;
             ox_d=(double)(*dx)-2.0*dd*mx;oy_d=(double)(*dy)-2.0*dd*my;oz_d=(double)(*dz)-2.0*dd*mz;
         }else{
-            double ct=sqrt(fmax(0.0,kt));
-            ox_d=eta*(double)(*dx)+(eta*ci_d-ct)*mx;
-            oy_d=eta*(double)(*dy)+(eta*ci_d-ct)*my;
-            oz_d=eta*(double)(*dz)+(eta*ci_d-ct)*mz;
+            float tx,ty,tz;
+            if(!particle_energy_refract3(*dx,*dy,*dz,(float)mx,(float)my,(float)mz,
+                    n1,k1,n2,k2,&tx,&ty,&tz)){
+                micro_set_failure(failure_code,REFRACTION_VECTOR_INVALID);return MICRO_NUMERICAL_FAILURE;
+            }
+            ox_d=tx;oy_d=ty;oz_d=tz;
             outside=1-outside;
         }
         double qn=sqrt(ox_d*ox_d+oy_d*oy_d+oz_d*oz_d);
         if(!(qn>0.0)||!isfinite(qn)||!isfinite(ox_d)||!isfinite(oy_d)||!isfinite(oz_d)){
-            *scatter_order=order;micro_set_failure(failure_code,tir?REFLECTION_VECTOR_INVALID:REFRACTION_VECTOR_INVALID);return MICRO_NUMERICAL_FAILURE;
+            *scatter_order=order;micro_set_failure(failure_code,REFRACTION_VECTOR_INVALID);return MICRO_NUMERICAL_FAILURE;
         }
         ox_d/=qn;oy_d/=qn;oz_d/=qn;float ox=(float)ox_d,oy=(float)oy_d,oz=(float)oz_d;
         if(!isfinite(ox)||!isfinite(oy)||!isfinite(oz)){
@@ -2434,6 +2523,9 @@ __device__ int sphere_fresnel_interaction_3d_sampled_ex(
     }
     if(dot3(*vx,*vy,*vz,gnx,gny,gnz)>=0.0f){prod_set_failure(prod_failure_code,prod_failure_subcode,PROD_PARTICLE_MACRO_GEOMETRY_FAILURE,PROD_SUB_SPHERE_ENTRY_SIDE);return 0;}
 
+    // Approximation: homogeneous bulk Beer-Lambert path length is used along
+    // energy-transport rays. An inhomogeneous planar transmitted wave has
+    // interface-normal attenuation, so this is not an exact Maxwell solution.
     // Propagate inside a particle in local double-precision coordinates.
     // Centimetre-scale float32 world coordinates cannot resolve kaolin radii
     // near 1e-7 m accurately. Interface sampling retains its float RNG semantics.
@@ -2442,7 +2534,7 @@ __device__ int sphere_fresnel_interaction_3d_sampled_ex(
     double qn0=sqrt(qx*qx+qy*qy+qz*qz);
     if(!(qn0>0.0)||!isfinite(qn0)){prod_set_failure(prod_failure_code,prod_failure_subcode,PROD_PARTICLE_MACRO_GEOMETRY_FAILURE,PROD_SUB_SPHERE_CHORD);return 0;}
     qx*=rr/qn0;qy*=rr/qn0;qz*=rr/qn0;
-    float alpha_abs=(wavelength>0.0f && k_particle>0.0f)?(4.0f*PI_F*k_particle/wavelength):0.0f;
+    float alpha_abs=particle_internal_absorption_coefficient(k_particle,wavelength);
     for(int bounce=0;bounce<=max_bounces;++bounce){
         if(out_macro_bounces)*out_macro_bounces=bounce;
         double dvx=(double)(*vx),dvy=(double)(*vy),dvz=(double)(*vz);
@@ -2471,10 +2563,10 @@ __device__ int sphere_fresnel_interaction_3d_sampled_ex(
         if(!(arrival_dot>0.0)||!isfinite(arrival_dot)||!isfinite(tq2)||sphere_err>sphere_tol){prod_set_failure(prod_failure_code,prod_failure_subcode,PROD_PARTICLE_MACRO_GEOMETRY_FAILURE,PROD_SUB_SPHERE_CHORD);return 0;}
         float chord_f=(float)chord;
         if(alpha_abs>0.0f){
-            float survival=expf(-alpha_abs*chord_f);
-            if(rnd_uniform(state)>survival){
-                qx=tqx;qy=tqy;qz=tqz;
-                *x=(float)(cx+qx);*y=(float)(cy+qy);*z=(float)(cz+qz);*internal_path+=chord_f;(*p_absorptions)++;return 2;
+            double absorption_distance=sample_particle_absorption_distance(state,alpha_abs);
+            if(absorption_distance<chord){
+                qx+=absorption_distance*dvx;qy+=absorption_distance*dvy;qz+=absorption_distance*dvz;
+                *x=(float)(cx+qx);*y=(float)(cy+qy);*z=(float)(cz+qz);*internal_path+=(float)absorption_distance;(*p_absorptions)++;return 2;
             }
         }
         qx=tqx;qy=tqy;qz=tqz;*internal_path+=chord_f;
@@ -2728,12 +2820,12 @@ __device__ int spheroid_fresnel_scatter_direction_only_3d_ex(
         (*p_reflections)++;(*p_entry_reflections)++;return 1;
     }
     if(dot3(*vx,*vy,*vz,gnx,gny,gnz)>=0.0f){prod_set_failure(prod_failure_code,prod_failure_subcode,PROD_SPHEROID_GEOMETRY_FAILURE,PROD_SUB_SPHEROID_ENTRY);return 0;}
-    float alpha_abs=(wavelength>0.0f&&k_particle>0.0f)?(4.0f*PI_F*k_particle/wavelength):0.0f;
+    float alpha_abs=particle_internal_absorption_coefficient(k_particle,wavelength);
     for(int bounce=0;bounce<=max_bounces;++bounce){
         if(out_macro_bounces)*out_macro_bounces=bounce;
         float chord=spheroid_next_boundary_distance(x,y,z,*vx,*vy,*vz,ux,uy,uz,invb2,delta,scale);
         if(chord<=0.0f){prod_set_failure(prod_failure_code,prod_failure_subcode,PROD_SPHEROID_GEOMETRY_FAILURE,PROD_SUB_SPHEROID_CHORD);return 0;}
-        if(alpha_abs>0.0f){float survival=expf(-alpha_abs*chord);if(rnd_uniform(state)>survival){*internal_path+=chord;(*p_absorptions)++;return 2;}}
+        if(alpha_abs>0.0f){double absorption_distance=sample_particle_absorption_distance(state,alpha_abs);if(absorption_distance<(double)chord){*internal_path+=(float)absorption_distance;(*p_absorptions)++;return 2;}}
         x+=chord*(*vx);y+=chord*(*vy);z+=chord*(*vz);*internal_path+=chord;
         float nox,noy,noz;spheroid_normal(x,y,z,ux,uy,uz,invb2,delta,&nox,&noy,&noz);
         float bx=-nox,by=-noy,bz=-noz;top=1;order=0;mfc=MICRO_FAIL_NONE;
@@ -3344,6 +3436,37 @@ __device__ void light_diag_record_event(
     int q=(iz*ny+iy)*nx+ix;atomicAdd(&event_weight[q],1.0f);atomicAdd(&event_count[q],1U);
 }
 
+// Absorption grid records accepted extinction encounter sites, not candidate trials.
+__device__ void light_diag_record_absorption(
+    const int active,const int nx,const int ny,const int nz,const float Rin,
+    const float zmin,const float zmax,const float x,const float y,const float z,const unsigned int gid,
+    unsigned int* event_count,unsigned long long* event_total,
+    unsigned int* error_count,unsigned int* event_outside_count,unsigned int* boundary_adjustment_count){
+    if(!active)return;
+    atomicAdd(event_total,1ULL);
+    const float coordinate_tol=2.0e-6f*fmaxf(2.0f*Rin,zmax-zmin);
+    if(!isfinite(x)||!isfinite(y)||!isfinite(z)||x < -Rin-coordinate_tol || x > Rin+coordinate_tol ||
+       y < -Rin-coordinate_tol || y > Rin+coordinate_tol ||
+       z < zmin-coordinate_tol || z > zmax+coordinate_tol){
+        unsigned int previous=atomicAdd(event_outside_count,1U);
+        if(previous==0U){
+            event_outside_count[1]=__float_as_uint(x);event_outside_count[2]=__float_as_uint(y);event_outside_count[3]=__float_as_uint(z);
+            event_outside_count[4]=gid;event_outside_count[5]=__float_as_uint(coordinate_tol);event_outside_count[6]=1U;
+        }
+        atomicAdd(error_count,1U);return;
+    }
+    int ix=(int)floorf(((x+Rin)/(2.0f*Rin))*nx);
+    int iy=(int)floorf(((y+Rin)/(2.0f*Rin))*ny);
+    int iz=(int)floorf(((z-zmin)/(zmax-zmin))*nz);
+    int adjusted=0;
+    if(ix<0){ix=0;adjusted=1;}else if(ix>=nx){ix=nx-1;adjusted=1;}
+    if(iy<0){iy=0;adjusted=1;}else if(iy>=ny){iy=ny-1;adjusted=1;}
+    if(iz<0){iz=0;adjusted=1;}else if(iz>=nz){iz=nz-1;adjusted=1;}
+    if(adjusted)atomicAdd(boundary_adjustment_count,1U);
+    if(ix<0||ix>=nx||iy<0||iy>=ny||iz<0||iz>=nz){atomicAdd(event_outside_count,1U);atomicAdd(error_count,1U);return;}
+    int q=(iz*ny+iy)*nx+ix;atomicAdd(&event_count[q],1U);
+}
+
 __global__ void light_diag_segment_test_kernel(
     const float* segments7,const int n,const int nx,const int ny,const int nz,
     const float Rin,const float zmin,const float zmax,float* total_grid,float* post_grid,
@@ -3384,7 +3507,11 @@ __global__ void mie_coefficients_efficiencies_kernel(
     double mr=n_real[p]/n_medium,mi=k_imag[p]/n_medium;
     int nstop=(int)(x+4.0*cbrt(x)+2.0);if(nstop<1)nstop=1;
     double mz=hypot(mr*x,mi*x);
-    int nmx=(int)fmax((double)nstop,mz)+15;if(nmx<nstop+1)nmx=nstop+1;
+    // Zero-start downward recurrence needs a converged tail, particularly for
+    // large, weakly absorbing particles. A 128-order tail is verified against
+    // direct Riccati-Bessel coefficients for supplied PSDs at 470/622/940 nm.
+    // MIE_MAX_ORDER still bounds workspace; oversized cases fail explicitly.
+    int nmx=(int)fmax((double)nstop,mz)+128;if(nmx<nstop+1)nmx=nstop+1;
     if(nmx>=MIE_MAX_ORDER || nstop>=MIE_MAX_ORDER){nstop_out[p]=0;atomicExch(error_flag,1);return;}
     nstop_out[p]=nstop;
     int base=p*MIE_MAX_ORDER;
@@ -3716,7 +3843,7 @@ __global__ void orthokinetic_compact_aggregation_fragmentation_kernel(
 }
 
 __global__ void transport_precompute_kernel(
-    const double* diameter,const double* weights,const double* qext,const double* qsca,const int n_particles,
+    const double* diameter,const double* weights,const double* qext,const double* qsca,const double* k_imag,const int n_particles,
     const double concentration,const double density,const int weight_mode,const int event_model,const double wave_scale,
     const double n_medium,const double wavelength,const double wave_rms_height_m,
     double* radius,double* particle_mass,double* source_weight,double* number_density,
@@ -3737,9 +3864,16 @@ __global__ void transport_precompute_kernel(
         else nd=(avg_mass>0.0?concentration/avg_mass:0.0)*source_weight[i];
         number_density[i]=nd;
         double sg=PI_D*radius[i]*radius[i],ss=fmax(qsca[i],0.0)*sg,se=fmax(qext[i],0.0)*sg;
+        double tol=1e-10*fmax(1.0,fmax(fabs(qext[i]),fabs(qsca[i])));
+        if(!isfinite(k_imag[i])||k_imag[i]<0.0||!isfinite(qext[i])||!isfinite(qsca[i])||qext[i]<-tol||qsca[i]<-tol||qsca[i]>qext[i]+tol||(k_imag[i]==0.0&&fabs(qext[i]-qsca[i])>tol)){atomicExch(error_flag,5);return;}
         double swv=0.0;
         if(event_model==3) swv=wave_scale*fmax(qsca[i]-1.0,0.0)*sg;
-        else if(event_model==4 || event_model==5) swv=fmax(ss-sg,0.0);
+        else if(event_model==4 || event_model==5){
+            // Extinction bin selection retains the candidate geometric/wave prior.
+            // Nonabsorbing bins retain the verified scattering-rate arithmetic.
+            double rate=(k_imag[i]>0.0)?se:ss;
+            swv=(k_imag[i]>0.0)?((ss>0.0)?rate*fmax(ss-sg,0.0)/ss:0.0):fmax(ss-sg,0.0);
+        }
         sigma_geom[i]=sg;sigma_sca[i]=ss;sigma_ext[i]=se;sigma_wave[i]=swv;
         mu_geom_bin[i]=nd*sg;mu_sca_bin[i]=nd*ss;mu_ext_bin[i]=nd*se;mu_wave_bin[i]=nd*swv;
     }
@@ -3752,17 +3886,17 @@ __global__ void transport_precompute_kernel(
         else if(event_model==1)mb=mu_sca_bin[i];
         else if(event_model==2)mb=mu_ext_bin[i];
         else if(event_model==3)mb=mu_geom_bin[i]+mu_wave_bin[i];
-        else mb=mu_sca_bin[i]; // exact-Mie total event rate.
+        else mb=(k_imag[i]>0.0)?mu_ext_bin[i]:mu_sca_bin[i]; // Mie extinction closure.
         mu_event_bin[i]=mb;mt+=mb;
         if(event_model==0)sigma_event[i]=sigma_geom[i];
         else if(event_model==1)sigma_event[i]=sigma_sca[i];
         else if(event_model==2)sigma_event[i]=sigma_ext[i];
         else if(event_model==3)sigma_event[i]=sigma_geom[i]+sigma_wave[i];
-        else sigma_event[i]=sigma_sca[i];
+        else sigma_event[i]=(k_imag[i]>0.0)?sigma_ext[i]:sigma_sca[i];
     }
-    // For the geometric transport coefficient is the exact-rate remainder
-    // mu_sca-mu_wave = nd*min(sigma_sca,sigma_geom).  The stored mu_geom_bin remains
-    // the physical projected-area coefficient for diagnostics/CSA accounting.
+    // Candidate-channel proposal decomposition of the extinction coefficient.
+    // mu_geom_bin retains the physical projected-area diagnostic, not a production rate.
+    // Conditional acceptance changes the accepted geometric/wave mixture.
     double mtrace_geom=((event_model==4)||(event_model==5))?fmax(mt-mw,0.0):((event_model==3)?mg:mt);
     double mtrace_wave=((event_model==3)||(event_model==4)||(event_model==5))?mw:0.0;
     double cg=0.0,cw=0.0,ct=0.0;
@@ -4341,6 +4475,79 @@ __device__ void apply_mie_moment_constraint(
     *vx=cp*vinx+sp*px;*vy=cp*viny+sp*py;*vz=cp*vinz+sp*pz;normalize3(vx,vy,vz);
 }
 
+
+// Conditional finite-particle closure. Only this returned history is committed.
+// stats: trials, outcome rejections, inaccessible placements, accepted G/C/M,
+//        accepted absorption/scattering, numerical failures, retry exhaustion.
+struct ConditionalHistory {
+ float x,y,z,vx,vy,vz,path,incidence,exit_angle,rho,phi,cx,cy,cz,center_clear,wall_clear,bottom_clear,top_clear;
+ int pr,per,pir,pabs,status,channel,event_type,macro,micro,failure,subcode;
+};
+__device__ double conditional_uniform(unsigned int* state){
+ // Two xorshift words provide a 53-bit [0,1) roulette, without float endpoints.
+ unsigned int a=xorshift32_state(state),b=xorshift32_state(state);
+ return ((double)(a>>5)*67108864.0+(double)(b>>6))*1.11022302462515654042e-16;
+}
+__device__ ConditionalHistory conditional_particle_interaction(
+ unsigned int* state,int pidx,double qs,double qe,float nm,float nr,float ki,float wl,float rough,float radius,
+ float aspect,int orientation,float kappa,int max_bounces,float coherent,const double* cdf,const double* theta,int nt,
+ float x,float y,float z,float vx,float vy,float vz,
+ float rin,float zmin,float zmean,int surface,float delta,float core,int max_trials,unsigned long long* stats){
+ ConditionalHistory h={};h.failure=PROD_OTHER_EXPLICIT_FAILURE;h.subcode=9002;
+ double tol=1e-10*fmax(1.0,fmax(fabs(qs),fabs(qe)));
+ if(max_trials==0){h.subcode=9001;++stats[9];return h;}
+ if(!isfinite(qs)||!isfinite(qe)||qe<=0.0||qs<-tol||qs>qe+tol||max_trials<1){++stats[8];return h;}
+ double albedo=(ki==0.0f&&fabs(qe-qs)<=tol)?1.0:fmin(fmax(qs/qe,0.0),1.0);
+ double absorption_probability=(ki==0.0f&&fabs(qe-qs)<=tol)?0.0:fmin(fmax((qe-qs)/qe,0.0),1.0);
+ // The unchanged xorshift32 state has 32-bit entropy; do not clip unresolvable outcomes.
+ if((ki>0.0f&&(absorption_probability<=0.0||albedo>=1.0))||(albedo>0.0&&albedo<2.3283064365386962890625e-10)||(absorption_probability>0.0&&absorption_probability<2.3283064365386962890625e-10)){
+  h.subcode=9003;++stats[8];return h;
+ }
+ int target_absorbed=(albedo<1.0 && conditional_uniform(state)>=albedo);
+ double wave=qs>0.0?fmax(qs-1.0,0.0)/qs:0.0;
+ for(int trial=0;trial<max_trials;++trial){
+  ++stats[0];
+  h={};h.x=x;h.y=y;h.z=z;h.vx=vx;h.vy=vy;h.vz=vz;h.incidence=-1;h.exit_angle=-1;
+  h.channel=(conditional_uniform(state)<wave)?((coherent>=1.0f||conditional_uniform(state)<coherent)?1:2):0;
+  if(h.channel==1){mie_scatter_direction(state,cdf,theta,nt,pidx,&h.vx,&h.vy,&h.vz);h.status=1;h.event_type=4;}
+  else if(h.channel==2){
+   float fr=sqrtf(x*x+y*y),fx=1,fy=0;if(fr>1e-12f){fx=-y/fr;fy=x/fr;}
+   h.status=spheroid_fresnel_scatter_direction_only_3d_ex(state,nm,nr,ki,wl,rough,radius,aspect,orientation,kappa,fx,fy,0,
+    max_bounces,&h.vx,&h.vy,&h.vz,&h.path,&h.pr,&h.per,&h.pir,&h.pabs,&h.failure,&h.subcode,&h.macro,&h.micro,&h.incidence,&h.exit_angle);
+   h.event_type=h.per?5:(h.pir?7:6);
+  }else{
+   float rho,phi,gx,gy,gz,cx,cy,cz,cc,wc,bc,tc;
+   sphere_sample_geometry(state,radius,x,y,z,vx,vy,vz,&rho,&phi,&gx,&gy,&gz,&cx,&cy,&cz);
+   double dcx=(double)x-(double)radius*gx,dcy=(double)y-(double)radius*gy,dcz=(double)z-(double)radius*gz;
+   if(!sphere_particle_accessible_in_water(dcx,dcy,dcz,radius,rin,zmin,zmean,surface,delta,core,&cc,&wc,&bc,&tc)){
+    ++stats[2];continue; // sampling conditioning, not a transport null
+   }
+   h.rho=rho;h.phi=phi;h.cx=(float)dcx;h.cy=(float)dcy;h.cz=(float)dcz;
+   h.center_clear=cc;h.wall_clear=wc;h.bottom_clear=bc;h.top_clear=tc;
+   h.status=sphere_fresnel_interaction_3d_sampled_ex(state,nm,nr,ki,wl,rough,radius,max_bounces,gx,gy,gz,dcx,dcy,dcz,
+    &h.x,&h.y,&h.z,&h.vx,&h.vy,&h.vz,&h.path,&h.pr,&h.per,&h.pir,&h.pabs,&h.failure,&h.subcode,&h.macro,&h.micro,&h.incidence,&h.exit_angle);
+   h.event_type=h.per?1:(h.pir?3:2);
+  }
+  if(h.status!=1&&h.status!=2){++stats[8];return h;}
+  if((h.status==2)!=target_absorbed){++stats[1];continue;}
+  ++stats[3+h.channel];++stats[h.status==2?6:7];return h;
+ }
+ h={};h.failure=PROD_OTHER_EXPLICIT_FAILURE;h.subcode=9001;++stats[9];return h;
+}
+
+// Thread-owned trial counters avoid shared-state mutation during sampling.
+// Only the completed encounter's sampler counters are merged into global diagnostics.
+__device__ ConditionalHistory conditional_particle_interaction_accumulate(
+ unsigned int* state,int pidx,double qs,double qe,float nm,float nr,float ki,float wl,float rough,float radius,
+ float aspect,int orientation,float kappa,int max_bounces,float coherent,const double* cdf,const double* theta,int nt,
+ float x,float y,float z,float vx,float vy,float vz,
+ float rin,float zmin,float zmean,int surface,float delta,float core,int max_trials,unsigned long long* stats){
+ unsigned long long local_stats[10]={};
+ ConditionalHistory h=conditional_particle_interaction(state,pidx,qs,qe,nm,nr,ki,wl,rough,radius,aspect,orientation,kappa,max_bounces,coherent,cdf,theta,nt,x,y,z,vx,vy,vz,rin,zmin,zmean,surface,delta,core,max_trials,local_stats);
+ for(int i=0;i<10;++i)if(local_stats[i])atomicAdd(stats+i,local_stats[i]);
+ return h;
+}
+
 __global__ void trace_kernel(
     const float MAX_ITERATIONS,const double* MU_CHANNELS,
     const float N_WATER,const float N_ACRYLIC,const float N_AIR,const float PARTICLE_WAVELENGTH,const float PARTICLE_SURFACE_ROUGH_ALPHA,const float WAVE_SPHEROID_ASPECT_RATIO,
@@ -4354,6 +4561,7 @@ __global__ void trace_kernel(
     const int N_rays,
     const double* geometric_cdf,const double* wave_cdf,const double* mie_phase_cdf,const double* mie_theta,const int mie_ntheta,
     const double* particle_n,const double* particle_k,const double* particle_radius,const int n_particles,
+    const double* particle_qsca,const double* particle_qext,const int CONDITIONAL_ENABLED,const int CONDITIONAL_RETRIES,unsigned long long* conditional_stats,
     const double* MOMENT_A,const double* MOMENT_B,const unsigned char* MOMENT_MODE,
     const int SEDIMENT_TRANSPORT_MODEL,const double* TRACE_GEOM_BIN,const double* TRACE_WAVE_BIN,
     const double* SED_A,const double* SED_B,const double* SED_NORM_SCALED,const double* SED_RADIAL_LOG,const int SED_N_RADIAL,const double* SED_MAJORANTS,
@@ -4361,9 +4569,9 @@ __global__ void trace_kernel(
     float* heat_xy,float* heat_zy,
     const int LIGHT_DIAG_ENABLED,const unsigned int LIGHT_DIAG_MAX_RAYS,
     const int LIGHT_DIAG_NX,const int LIGHT_DIAG_NY,const int LIGHT_DIAG_NZ,const float LIGHT_DIAG_ZMAX,
-    float* light_total_grid,float* light_post_grid,float* light_event_weight,unsigned int* light_event_count,
+    float* light_total_grid,float* light_post_grid,float* light_event_weight,unsigned int* light_event_count,unsigned int* light_absorption_count,
     double* light_segment_total,double* light_deposited_total,unsigned long long* light_segment_count,
-    unsigned long long* light_event_total,unsigned int* light_error_count,unsigned int* light_boundary_adjustment_count,unsigned int* light_event_outside_count,
+    unsigned long long* light_event_total,unsigned long long* light_absorption_total,unsigned int* light_error_count,unsigned int* light_boundary_adjustment_count,unsigned int* light_event_outside_count,
     const int LIGHT_DIAG_REP_RAYS,const int LIGHT_DIAG_MAX_SEGMENTS,
     float* light_tx0,float* light_ty0,float* light_tz0,float* light_tx1,float* light_ty1,float* light_tz1,
     int* light_torder,int* light_tevent,int* light_tcount,int* light_toverflow,
@@ -4600,9 +4808,52 @@ __global__ void trace_kernel(
             // zero-RNG drill-down of the finite-particle path that produces the largest turn.
             int event_macro_bounces=0,event_terminal_micro_order=0;
             int use_wave=(LOCAL_WAVE>0.0f && rnd_uniform(&state)*LOCAL_TOTAL>=LOCAL_GEOM);
-            if(use_wave){
+            int selected_bin=-1;
+            if(CONDITIONAL_ENABLED){
+                const double* bin_cdf=use_wave?wave_cdf:geometric_cdf;
+                const double* bin_rate=use_wave?TRACE_WAVE_BIN:TRACE_GEOM_BIN;
+                selected_bin=(SEDIMENT_TRANSPORT_MODEL==0)?sample_cdf_index(&state,bin_cdf,n_particles):sample_local_mu_bin(&state,SEDIMENT_TRANSPORT_MODEL,FREE_SURFACE_MODEL,bin_rate,n_particles,SED_A,SED_B,SED_NORM_SCALED,SED_RADIAL_LOG,SED_N_RADIAL,SED_GRID,SED_GRID_NR,SED_GRID_NZ,SED_GRID_ZMAX,x,y,z,RIN,ZMIN,VORTEX_CORE_RADIUS,(double)(use_wave?LOCAL_WAVE:LOCAL_GEOM));
+            }
+            // Zero-k bins follow the verified unconditional path, including its RNG draws.
+            if(CONDITIONAL_ENABLED && particle_k[selected_bin]>0.0){
+                if((float)particle_k[selected_bin]==0.0f){pf=PROD_OTHER_EXPLICIT_FAILURE;pfs=9003;pfstep=step;pfmedium=4;st=4;atomicAdd(conditional_stats+8,1ULL);break;}
+                ConditionalHistory h=conditional_particle_interaction_accumulate(&stateOPT,selected_bin,particle_qsca[selected_bin],particle_qext[selected_bin],N_WATER,(float)particle_n[selected_bin],(float)particle_k[selected_bin],PARTICLE_WAVELENGTH,PARTICLE_SURFACE_ROUGH_ALPHA,(float)particle_radius[selected_bin],WAVE_SPHEROID_ASPECT_RATIO,WAVE_SPHEROID_ORIENTATION_MODEL,WAVE_SPHEROID_ORIENTATION_KAPPA,MAX_PARTICLE_BOUNCES,WAVE_COHERENT_FRACTION,mie_phase_cdf,mie_theta,mie_ntheta,x,y,z,vx,vy,vz,RIN,ZMIN,ZMEAN,FREE_SURFACE_MODEL,VORTEX_DELTA_H,VORTEX_CORE_RADIUS,CONDITIONAL_RETRIES,conditional_stats);
+                event_pidx=selected_bin;
+                if(h.status!=1&&h.status!=2){pf=h.failure?h.failure:PROD_OTHER_EXPLICIT_FAILURE;pfs=h.subcode;pfstep=step;pfmacro=h.macro;pfmicro=h.micro;pfmedium=4;pfevent=h.channel==0?1:2;st=4;break;}
+                x=h.x;y=h.y;z=h.z;vx=h.vx;vy=h.vy;vz=h.vz;
+                pr+=h.pr;per+=h.per;pir+=h.pir;pabs+=h.pabs;
+                if(h.channel==0){
+                    gic++;pd_bin=selected_bin;pd_prev_evt=last_evt;pd_overlap=0;pd_accept=1;pd_proposals++;pd_accessible++;
+                    pd_radius=(float)particle_radius[selected_bin];pd_rho=h.rho;pd_phi=h.phi;pd_cx=h.cx;pd_cy=h.cy;pd_cz=h.cz;
+                    pd_ex=event_site_x;pd_ey=event_site_y;pd_ez=event_site_z;pd_prex=pd_ex;pd_prey=pd_ey;pd_prez=pd_ez;
+                    pd_prevx=vinx;pd_prevy=viny;pd_prevz=vinz;pd_xx=x;pd_xy=y;pd_xz=z;pd_postx=x;pd_posty=y;pd_postz=z;pd_postvx=vx;pd_postvy=vy;pd_postvz=vz;
+                    pd_center_clear=h.center_clear;pd_wall_clear=h.wall_clear;pd_bottom_clear=h.bottom_clear;pd_top_clear=h.top_clear;
+                }else{wic++;if(h.channel==1)wcoh++;else wmorph++;}
+                event_internal_path=h.path;event_incidence_deg=h.incidence;event_exit_deg=h.exit_angle;
+                event_macro_bounces=h.macro;event_terminal_micro_order=h.micro;event_type=h.event_type;
+                if(h.status==2){
+                    // Commit the absorbed encounter's location and channel provenance;
+                    // angular-deflection statistics remain survivor-only.
+                    event_sum_r+=event_site_r;event_sum_z+=event_site_z;
+                    event_min_r=fminf(event_min_r,event_site_r);event_max_r=fmaxf(event_max_r,event_site_r);
+                    event_min_z=fminf(event_min_z,event_site_z);event_max_z=fmaxf(event_max_z,event_site_z);
+                    int absorbed_branch=h.channel==0?1:2;
+                    if(previous_branch>0&&absorbed_branch!=previous_branch)branch_transitions++;
+                    if(previous_event_type>0&&event_type!=previous_event_type)event_type_transitions++;
+                    if(acrylic_returns_after_particle>0)particle_events_after_acrylic_return++;
+                    if(first_pbin<0)first_pbin=selected_bin;last_pbin=selected_bin;
+                    if(h.channel==0){if(first_gbin<0)first_gbin=selected_bin;last_gbin=selected_bin;}
+                    else{if(first_wbin<0)first_wbin=selected_bin;last_wbin=selected_bin;}
+                    if(ic==1){first_evt=event_type;first_evt_x=event_site_x;first_evt_y=event_site_y;first_evt_z=event_site_z;wp_first_evt=wp;}
+                    last_evt=event_type;last_evt_order=ic;last_evt_x=event_site_x;last_evt_y=event_site_y;last_evt_z=event_site_z;wp_last_evt=wp;
+                    internal_path_total+=h.path;internal_opl_total+=h.path*(float)particle_n[selected_bin];
+                    light_diag_record_absorption(light_diag_active,LIGHT_DIAG_NX,LIGHT_DIAG_NY,LIGHT_DIAG_NZ,RIN,ZMIN,LIGHT_DIAG_ZMAX,event_site_x,event_site_y,event_site_z,gid,light_absorption_count,light_absorption_total,light_error_count,light_event_outside_count,light_boundary_adjustment_count);
+                    light_diag_mark_last_event(gid,light_diag_active,LIGHT_DIAG_REP_RAYS,LIGHT_DIAG_MAX_SEGMENTS,light_tevent,light_tcount,9);st=5;break;
+                }
+            }else if(use_wave){
+                if(CONDITIONAL_ENABLED)atomicAdd(conditional_stats,1ULL);
                 wic++;
-                int pidx=(SEDIMENT_TRANSPORT_MODEL==0)?sample_cdf_index(&state,wave_cdf,n_particles):sample_local_mu_bin(&state,SEDIMENT_TRANSPORT_MODEL,FREE_SURFACE_MODEL,TRACE_WAVE_BIN,n_particles,SED_A,SED_B,SED_NORM_SCALED,SED_RADIAL_LOG,SED_N_RADIAL,SED_GRID,SED_GRID_NR,SED_GRID_NZ,SED_GRID_ZMAX,x,y,z,RIN,ZMIN,VORTEX_CORE_RADIUS,(double)LOCAL_WAVE);
+                int pidx=selected_bin>=0?selected_bin:(SEDIMENT_TRANSPORT_MODEL==0)?sample_cdf_index(&state,wave_cdf,n_particles):sample_local_mu_bin(&state,SEDIMENT_TRANSPORT_MODEL,FREE_SURFACE_MODEL,TRACE_WAVE_BIN,n_particles,SED_A,SED_B,SED_NORM_SCALED,SED_RADIAL_LOG,SED_N_RADIAL,SED_GRID,SED_GRID_NR,SED_GRID_NZ,SED_GRID_ZMAX,x,y,z,RIN,ZMIN,VORTEX_CORE_RADIUS,(double)LOCAL_WAVE);
                 event_pidx=pidx;
                 // sigma_h=0 gives C=1 without an extra RNG draw in the coherent branch.
                 int coherent=(WAVE_COHERENT_FRACTION>=1.0f) || (rnd_uniform(&stateOPT)<WAVE_COHERENT_FRACTION);
@@ -4610,6 +4861,7 @@ __global__ void trace_kernel(
                     wcoh++;
                     mie_scatter_direction(&stateOPT,mie_phase_cdf,mie_theta,mie_ntheta,pidx,&vx,&vy,&vz);
                     event_type=4;
+                    if(CONDITIONAL_ENABLED){atomicAdd(conditional_stats+4,1ULL);atomicAdd(conditional_stats+7,1ULL);}
                 } else {
                     wmorph++;
                     float fr=sqrtf(x*x+y*y);
@@ -4620,18 +4872,20 @@ __global__ void trace_kernel(
                         (float)particle_radius[pidx],WAVE_SPHEROID_ASPECT_RATIO,WAVE_SPHEROID_ORIENTATION_MODEL,WAVE_SPHEROID_ORIENTATION_KAPPA,ffx,ffy,ffz,
                         MAX_PARTICLE_BOUNCES,&vx,&vy,&vz,&event_internal_path,&pr,&per,&pir,&pabs,&ppc,&ppsub,&ppmb,&ppmo,&event_incidence_deg,&event_exit_deg);
                     if(ps==2){light_diag_mark_last_event(gid,light_diag_active,LIGHT_DIAG_REP_RAYS,LIGHT_DIAG_MAX_SEGMENTS,light_tevent,light_tcount,9);st=5;break;}
-                    if(ps!=1){light_diag_mark_last_event(gid,light_diag_active,LIGHT_DIAG_REP_RAYS,LIGHT_DIAG_MAX_SEGMENTS,light_tevent,light_tcount,10);pf=ppc?ppc:PROD_OTHER_EXPLICIT_FAILURE;pfs=ppsub;pfstep=step;pfmacro=ppmb;pfmicro=ppmo;pfmedium=4;pfevent=2;st=4;break;}
-                    event_macro_bounces=ppmb;event_terminal_micro_order=ppmo;
+                    if(ps!=1){if(CONDITIONAL_ENABLED)atomicAdd(conditional_stats+8,1ULL);light_diag_mark_last_event(gid,light_diag_active,LIGHT_DIAG_REP_RAYS,LIGHT_DIAG_MAX_SEGMENTS,light_tevent,light_tcount,10);pf=ppc?ppc:PROD_OTHER_EXPLICIT_FAILURE;pfs=ppsub;pfstep=step;pfmacro=ppmb;pfmicro=ppmo;pfmedium=4;pfevent=2;st=4;break;}
+                    if(CONDITIONAL_ENABLED){atomicAdd(conditional_stats+5,1ULL);atomicAdd(conditional_stats+7,1ULL);}
+                event_macro_bounces=ppmb;event_terminal_micro_order=ppmo;
                     event_type=(per>per_before)?5:((pir>pir_before)?7:6);
                 }
             } else {
+                if(CONDITIONAL_ENABLED)atomicAdd(conditional_stats,1ULL);
                 gic++;
-                int pidx=(SEDIMENT_TRANSPORT_MODEL==0)?sample_cdf_index(&state,geometric_cdf,n_particles):sample_local_mu_bin(&state,SEDIMENT_TRANSPORT_MODEL,FREE_SURFACE_MODEL,TRACE_GEOM_BIN,n_particles,SED_A,SED_B,SED_NORM_SCALED,SED_RADIAL_LOG,SED_N_RADIAL,SED_GRID,SED_GRID_NR,SED_GRID_NZ,SED_GRID_ZMAX,x,y,z,RIN,ZMIN,VORTEX_CORE_RADIUS,(double)LOCAL_GEOM);
+                int pidx=selected_bin>=0?selected_bin:(SEDIMENT_TRANSPORT_MODEL==0)?sample_cdf_index(&state,geometric_cdf,n_particles):sample_local_mu_bin(&state,SEDIMENT_TRANSPORT_MODEL,FREE_SURFACE_MODEL,TRACE_GEOM_BIN,n_particles,SED_A,SED_B,SED_NORM_SCALED,SED_RADIAL_LOG,SED_N_RADIAL,SED_GRID,SED_GRID_NR,SED_GRID_NZ,SED_GRID_ZMAX,x,y,z,RIN,ZMIN,VORTEX_CORE_RADIUS,(double)LOCAL_GEOM);
                 event_pidx=pidx;
                 int ppc=PROD_OK,ppsub=PROD_SUB_NONE,ppmb=0,ppmo=0;
-                // sample the finite sphere placement ONCE, validate the ACTUAL sampled centre,
-                // then execute the interaction with exactly that geometry.  Inaccessible proposals are
-                // null collisions in the bulk proposal process.
+                // Validate the initial sphere candidate's actual centre. Conditional closures
+                // retry inaccessible placements at this encounter; other event laws retain
+                // their bulk-proposal null-collision semantics.
                 float proposed_radius=(float)particle_radius[pidx];
                 float srho=0.0f,sphi=0.0f,sgnx=0.0f,sgny=0.0f,sgnz=0.0f,scx=x,scy=y,scz=z;
                 const float prepx=x,prepy=y,prepz=z,prepvx=vx,prevpy=vy,prevpz=vz;
@@ -4645,19 +4899,41 @@ __global__ void trace_kernel(
                 float center_clear=0.0f,wall_clear=0.0f,bottom_clear=0.0f,top_clear=0.0f;
                 int accessible=sphere_particle_accessible_in_water(dscx,dscy,dscz,(double)proposed_radius,RIN,ZMIN,ZMEAN,FREE_SURFACE_MODEL,VORTEX_DELTA_H,VORTEX_CORE_RADIUS,
                     &center_clear,&wall_clear,&bottom_clear,&top_clear);
+                if(accessible || !CONDITIONAL_ENABLED){
                 pd_bin=pidx;pd_prev_evt=last_evt;pd_overlap=accessible?0:1;pd_accept=accessible?1:0;pd_proposals++;
                 pd_radius=proposed_radius;pd_rho=srho;pd_phi=sphi;pd_cx=scx;pd_cy=scy;pd_cz=scz;
                 pd_ex=x;pd_ey=y;pd_ez=z;pd_prex=prepx;pd_prey=prepy;pd_prez=prepz;pd_prevx=prepvx;pd_prevy=prevpy;pd_prevz=prevpz;
                 pd_center_clear=center_clear;pd_wall_clear=wall_clear;pd_bottom_clear=bottom_clear;pd_top_clear=top_clear;
+                }
+                if(!accessible && CONDITIONAL_ENABLED){
+                    // For nonabsorbing bins the first accessible candidate is accepted.
+                    // A boundary placement rejection must not remove a Mie encounter.
+                    atomicAdd(conditional_stats+2,1ULL);
+                    ConditionalHistory h=conditional_particle_interaction_accumulate(&stateOPT,pidx,particle_qsca[pidx],particle_qext[pidx],N_WATER,(float)particle_n[pidx],(float)particle_k[pidx],PARTICLE_WAVELENGTH,PARTICLE_SURFACE_ROUGH_ALPHA,proposed_radius,WAVE_SPHEROID_ASPECT_RATIO,WAVE_SPHEROID_ORIENTATION_MODEL,WAVE_SPHEROID_ORIENTATION_KAPPA,MAX_PARTICLE_BOUNCES,WAVE_COHERENT_FRACTION,mie_phase_cdf,mie_theta,mie_ntheta,x,y,z,vx,vy,vz,RIN,ZMIN,ZMEAN,FREE_SURFACE_MODEL,VORTEX_DELTA_H,VORTEX_CORE_RADIUS,CONDITIONAL_RETRIES-1,conditional_stats);
+                    if(h.status!=1){pf=h.failure?h.failure:PROD_OTHER_EXPLICIT_FAILURE;pfs=h.subcode;pfstep=step;pfmedium=4;st=4;break;}
+                    x=h.x;y=h.y;z=h.z;vx=h.vx;vy=h.vy;vz=h.vz;
+                    pr+=h.pr;per+=h.per;pir+=h.pir;pabs+=h.pabs;
+                    gic--;if(h.channel==0)gic++;else{wic++;if(h.channel==1)wcoh++;else wmorph++;}
+                    event_internal_path=h.path;event_incidence_deg=h.incidence;event_exit_deg=h.exit_angle;event_macro_bounces=h.macro;event_terminal_micro_order=h.micro;event_type=h.event_type;
+                    if(h.channel==0){
+                        pd_bin=pidx;pd_prev_evt=last_evt;pd_overlap=0;pd_accept=1;pd_proposals++;pd_accessible++;
+                        pd_radius=proposed_radius;pd_rho=h.rho;pd_phi=h.phi;pd_cx=h.cx;pd_cy=h.cy;pd_cz=h.cz;
+                        pd_ex=event_site_x;pd_ey=event_site_y;pd_ez=event_site_z;pd_prex=pd_ex;pd_prey=pd_ey;pd_prez=pd_ez;pd_prevx=vinx;pd_prevy=viny;pd_prevz=vinz;
+                        pd_xx=x;pd_xy=y;pd_xz=z;pd_postx=x;pd_posty=y;pd_postz=z;pd_postvx=vx;pd_postvy=vy;pd_postvz=vz;
+                        pd_center_clear=h.center_clear;pd_wall_clear=h.wall_clear;pd_bottom_clear=h.bottom_clear;pd_top_clear=h.top_clear;
+                    }
+                }else{
                 if(!accessible){pd_null++;pd_xx=x;pd_xy=y;pd_xz=z;pd_postx=x;pd_posty=y;pd_postz=z;pd_postvx=vx;pd_postvy=vy;pd_postvz=vz;ic--;gic--;light_diag_mark_last_event(gid,light_diag_active,LIGHT_DIAG_REP_RAYS,LIGHT_DIAG_MAX_SEGMENTS,light_tevent,light_tcount,8);continue;}
                 pd_accessible++;
                 int ps=sphere_fresnel_interaction_3d_sampled_ex(&stateOPT,N_WATER,(float)particle_n[pidx],(float)particle_k[pidx],PARTICLE_WAVELENGTH,PARTICLE_SURFACE_ROUGH_ALPHA,proposed_radius,
                     MAX_PARTICLE_BOUNCES,sgnx,sgny,sgnz,dscx,dscy,dscz,&x,&y,&z,&vx,&vy,&vz,&event_internal_path,&pr,&per,&pir,&pabs,&ppc,&ppsub,&ppmb,&ppmo,&event_incidence_deg,&event_exit_deg);
                 pd_xx=x;pd_xy=y;pd_xz=z;pd_postx=x;pd_posty=y;pd_postz=z;pd_postvx=vx;pd_postvy=vy;pd_postvz=vz;
                 if(ps==2){light_diag_mark_last_event(gid,light_diag_active,LIGHT_DIAG_REP_RAYS,LIGHT_DIAG_MAX_SEGMENTS,light_tevent,light_tcount,9);st=5;break;}
-                if(ps!=1){light_diag_mark_last_event(gid,light_diag_active,LIGHT_DIAG_REP_RAYS,LIGHT_DIAG_MAX_SEGMENTS,light_tevent,light_tcount,10);pf=ppc?ppc:PROD_OTHER_EXPLICIT_FAILURE;pfs=ppsub;pfstep=step;pfmacro=ppmb;pfmicro=ppmo;pfmedium=4;pfevent=1;st=4;break;}
+                if(ps!=1){if(CONDITIONAL_ENABLED)atomicAdd(conditional_stats+8,1ULL);light_diag_mark_last_event(gid,light_diag_active,LIGHT_DIAG_REP_RAYS,LIGHT_DIAG_MAX_SEGMENTS,light_tevent,light_tcount,10);pf=ppc?ppc:PROD_OTHER_EXPLICIT_FAILURE;pfs=ppsub;pfstep=step;pfmacro=ppmb;pfmicro=ppmo;pfmedium=4;pfevent=1;st=4;break;}
+                if(CONDITIONAL_ENABLED){atomicAdd(conditional_stats+3,1ULL);atomicAdd(conditional_stats+7,1ULL);}
                 event_macro_bounces=ppmb;event_terminal_micro_order=ppmo;
                 event_type=(per>per_before)?1:((pir>pir_before)?3:2);pd_prev_evt=event_type;
+                }
             }
             // Optional Mie-two-moment constraints change only the post-outcome angle.
             // Event rate, branch selection, Fresnel outcome, internal path and event code
@@ -4834,7 +5110,7 @@ __global__ void single_particle_angular_audit_kernel(
     const float N_MEDIUM,const float WAVELENGTH,const float ROUGH_ALPHA,
     const float WAVE_SPHEROID_ASPECT_RATIO,const int WAVE_ORIENTATION_MODEL,const float WAVE_ORIENTATION_KAPPA,
     const int MAX_PARTICLE_BOUNCES,const double* PARTICLE_N,const double* PARTICLE_K,const double* PARTICLE_RADIUS,
-    const double* QSCA,const double* MIE_PHASE_CDF,const double* MIE_THETA,const int MIE_NTHETA,
+    const double* QSCA,const double* QEXT,const int CONDITIONAL_ENABLED,const int CONDITIONAL_RETRIES,const double* MIE_PHASE_CDF,const double* MIE_THETA,const int MIE_NTHETA,
     const float WAVE_COHERENT_FRACTION,const unsigned int SEED,
     float* INTERFACE_COS,unsigned char* INTERFACE_TYPE,unsigned char* INTERFACE_STATUS,
     float* PRODUCTION_COS,unsigned char* PRODUCTION_TYPE,unsigned char* PRODUCTION_STATUS){
@@ -4853,7 +5129,14 @@ __global__ void single_particle_angular_audit_kernel(
     if(ps==1){INTERFACE_COS[tid]=fminf(fmaxf(vy,-1.0f),1.0f);INTERFACE_TYPE[tid]=(unsigned char)((per>0)?1:((pir>0)?3:2));}
     else {INTERFACE_COS[tid]=0.0f;INTERFACE_TYPE[tid]=0;} // status!=1 makes payload invalid
 
-    // Exact per-bin branch mixture. For Qsca<1 the exact event-rate remainder is
+    if(CONDITIONAL_ENABLED && PARTICLE_K[p]>0.0){
+        unsigned long long trial_stats[10]={};
+        ConditionalHistory h=conditional_particle_interaction(&stateP,p,QSCA[p],QEXT[p],N_MEDIUM,(float)PARTICLE_N[p],(float)PARTICLE_K[p],WAVELENGTH,ROUGH_ALPHA,(float)PARTICLE_RADIUS[p],WAVE_SPHEROID_ASPECT_RATIO,WAVE_ORIENTATION_MODEL,WAVE_ORIENTATION_KAPPA,MAX_PARTICLE_BOUNCES,WAVE_COHERENT_FRACTION,MIE_PHASE_CDF,MIE_THETA,MIE_NTHETA,0,0,.5,0,1,0,10,0,1,0,0,1,CONDITIONAL_RETRIES,trial_stats);
+        PRODUCTION_STATUS[tid]=(unsigned char)h.status;
+        PRODUCTION_COS[tid]=h.status==1?fminf(fmaxf(h.vy,-1.0f),1.0f):0.0f;
+        PRODUCTION_TYPE[tid]=h.status==1?(unsigned char)h.event_type:0;return;
+    }
+    // Nonabsorbing per-bin branch mixture. For Qsca<1 the exact event-rate remainder is
     // entirely the geometric/interface branch. For Qsca>=1 the projected-area branch has
     // probability 1/Qsca and the Mie-excess wave branch has probability (Qsca-1)/Qsca.
     float pvx=0.0f,pvy=1.0f,pvz=0.0f;int ppr=0,pper=0,ppir=0,ppabs=0;float pip=0.0f;
@@ -4887,7 +5170,7 @@ __global__ void single_particle_moment_constrained_audit_kernel(
     const float N_MEDIUM,const float WAVELENGTH,const float ROUGH_ALPHA,
     const float WAVE_SPHEROID_ASPECT_RATIO,const int WAVE_ORIENTATION_MODEL,const float WAVE_ORIENTATION_KAPPA,
     const int MAX_PARTICLE_BOUNCES,const double* PARTICLE_N,const double* PARTICLE_K,const double* PARTICLE_RADIUS,
-    const double* QSCA,const double* MIE_PHASE_CDF,const double* MIE_THETA,const int MIE_NTHETA,
+    const double* QSCA,const double* QEXT,const int CONDITIONAL_ENABLED,const int CONDITIONAL_RETRIES,const double* MIE_PHASE_CDF,const double* MIE_THETA,const int MIE_NTHETA,
     const float WAVE_COHERENT_FRACTION,const unsigned int SEED,
     const double* MOMENT_A,const double* MOMENT_B,const unsigned char* MOMENT_MODE,
     float* BASE_COS,float* CONSTRAINED_COS,unsigned char* EVENT_TYPE,unsigned char* STATUS){
@@ -4899,7 +5182,11 @@ __global__ void single_particle_moment_constrained_audit_kernel(
     float vx=0.0f,vy=1.0f,vz=0.0f;int pr=0,per=0,pir=0,pabs=0;float ip=0.0f;
     float q=(float)fmax(QSCA[p],0.0);float geom_fraction=(q>1.0f)?(1.0f/q):1.0f;
     int use_wave=(q>1.0f && rnd_uniform(&state)>=geom_fraction);int ps=0;unsigned char typ=0;
-    if(!use_wave){
+    if(CONDITIONAL_ENABLED && PARTICLE_K[p]>0.0){
+        unsigned long long trial_stats[10]={};
+        ConditionalHistory h=conditional_particle_interaction(&state,p,QSCA[p],QEXT[p],N_MEDIUM,(float)PARTICLE_N[p],(float)PARTICLE_K[p],WAVELENGTH,ROUGH_ALPHA,(float)PARTICLE_RADIUS[p],WAVE_SPHEROID_ASPECT_RATIO,WAVE_ORIENTATION_MODEL,WAVE_ORIENTATION_KAPPA,MAX_PARTICLE_BOUNCES,WAVE_COHERENT_FRACTION,MIE_PHASE_CDF,MIE_THETA,MIE_NTHETA,0,0,.5,0,1,0,10,0,1,0,0,1,CONDITIONAL_RETRIES,trial_stats);
+        ps=h.status;vx=h.vx;vy=h.vy;vz=h.vz;typ=(unsigned char)h.event_type;
+    }else if(!use_wave){
         float x=0.0f,y=0.0f,z=0.0f;
         ps=sphere_fresnel_interaction_3d(&state,N_MEDIUM,(float)PARTICLE_N[p],(float)PARTICLE_K[p],WAVELENGTH,ROUGH_ALPHA,
             (float)PARTICLE_RADIUS[p],MAX_PARTICLE_BOUNCES,&x,&y,&z,&vx,&vy,&vz,&ip,&pr,&per,&pir,&pabs);
@@ -5996,6 +6283,7 @@ class ClaritasForwardModel:
                 wd,
                 qext,
                 qsca,
+                kd,
                 np.int32(n),
                 np.float64(conc),
                 np.float64(self.density),
@@ -6035,8 +6323,9 @@ class ClaritasForwardModel:
             raise RuntimeError(
                 f'CUDA particle transport precompute failed with error code {ecode}'
             )
-        # Per-bin angular constraints derive from the base sampler and exact Mie
-        # moments, never detector data.
+        # Preserve supplied per-bin angular maps and their boundedness checks.
+        # Absorbing-bin base distributions are now conditional; these coefficients
+        # are not automatically recalibrated to their Mie angular moments.
         moment_a = cp.ones(n, dtype=cp.float64)
         moment_b = cp.zeros(n, dtype=cp.float64)
         moment_mode = cp.zeros(n, dtype=cp.uint8)
@@ -6579,6 +6868,8 @@ class ClaritasForwardModel:
                 'mu_event': float(mu_host[6]),
                 'wave_coherent_fraction_nominal_cuda': float(mu_host[7]),
                 'event_model': self.particle_event_model,
+                'production_closure': ('Mie extinction and conditional terminal outcomes' if self.particle_event_model in {'hybrid_mie_exact_rate', 'hybrid_mie_exact_rate_moment_constrained'} else 'configured unconditioned event model'),
+                'wave_coefficient_basis': ('candidate extinction proposal rate; accepted conditional-channel rates differ' if self.particle_event_model in {'hybrid_mie_exact_rate', 'hybrid_mie_exact_rate_moment_constrained'} else 'configured unconditional wave coefficient'),
                 'wave_scale': self.hybrid_wave_scale,
                 'wave_surface_rms_height_m': self.wave_surface_rms_height_m,
                 'aggregation_model': self.aggregation_model,
@@ -6652,6 +6943,7 @@ class ClaritasForwardModel:
                 'phase_cdf': phase_cdf,
                 'theta': theta,
                 'qsca': qsca,
+                'qext': qext,
                 'moment_a': moment_a,
                 'moment_b': moment_b,
                 'moment_mode': moment_mode,
@@ -6728,7 +7020,9 @@ class ClaritasForwardModel:
                 dev['n'],
                 dev['k'],
                 dev['radius'],
-                dev['qsca'],
+                dev['qsca'], dev['qext'],
+                np.int32(self.particle_event_model in {'hybrid_mie_exact_rate', 'hybrid_mie_exact_rate_moment_constrained'}),
+                np.int32(CONDITIONAL_MAX_TRIALS),
                 dev['phase_cdf'],
                 dev['theta'],
                 np.int32(prep['ntheta']),
@@ -6809,7 +7103,9 @@ class ClaritasForwardModel:
                 dev['n'],
                 dev['k'],
                 dev['radius'],
-                dev['qsca'],
+                dev['qsca'], dev['qext'],
+                np.int32(self.particle_event_model in {'hybrid_mie_exact_rate', 'hybrid_mie_exact_rate_moment_constrained'}),
+                np.int32(CONDITIONAL_MAX_TRIALS),
                 dev['phase_cdf'],
                 dev['theta'],
                 np.int32(prep['ntheta']),
@@ -6968,9 +7264,9 @@ class ClaritasForwardModel:
             else self.zmean
         )
         light_voxels = light_nx * light_ny * light_nz if light_enabled else 1
-        # Four voxel fields plus bounded trajectories are explicit GPU allocations.
+        # Five voxel fields plus bounded trajectories are explicit GPU allocations.
         light_bytes = (
-            light_voxels * 16
+            light_voxels * 20
             + max(light_rep * light_max_segments, 1) * (6 * 4 + 2 * 4)
             + max(light_rep, 1) * 8
             + 8
@@ -6984,10 +7280,12 @@ class ClaritasForwardModel:
         light_post = cp.zeros(light_voxels, dtype=cp.float32)
         light_event_weight = cp.zeros(light_voxels, dtype=cp.float32)
         light_event_count = cp.zeros(light_voxels, dtype=cp.uint32)
+        light_absorption_count = cp.zeros(light_voxels, dtype=cp.uint32)
         light_segment_total = cp.zeros(1, dtype=cp.float64)
         light_deposited_total = cp.zeros(1, dtype=cp.float64)
         light_segment_count = cp.zeros(1, dtype=cp.uint64)
         light_event_total = cp.zeros(1, dtype=cp.uint64)
+        light_absorption_total = cp.zeros(1, dtype=cp.uint64)
         light_error_count = cp.zeros(1, dtype=cp.uint32)
         light_boundary_adjustment_count = cp.zeros(1, dtype=cp.uint32)
         light_event_outside_count = cp.zeros(32, dtype=cp.uint32)
@@ -7123,6 +7421,10 @@ class ClaritasForwardModel:
         causal_h170_first_angle_hist = np.zeros(6, dtype=np.float64)
         # exact-order, PSD provenance, and acrylic-assisted causal partitions.
         # Order rows are [0,1,2,3,4,5+] and are mutually exclusive by construction.
+        conditional_stats = cp.zeros(10, dtype=cp.uint64)
+        conditional_enabled = self.particle_event_model in {
+            'hybrid_mie_exact_rate', 'hybrid_mie_exact_rate_moment_constrained'
+        }
         exact_particle_order_scores = np.zeros((6, 18), dtype=np.float64)
         exact_geometric_order_scores = np.zeros((6, 18), dtype=np.float64)
         first_particle_bin_scores = np.zeros((npart, 18), dtype=np.float64)
@@ -7396,6 +7698,8 @@ class ClaritasForwardModel:
                         dev['k'],
                         dev['radius'],
                         np.int32(npart),
+                        dev['qsca'], dev['qext'], np.int32(conditional_enabled),
+                        np.int32(CONDITIONAL_MAX_TRIALS), conditional_stats,
                         dev['moment_a'],
                         dev['moment_b'],
                         dev['moment_mode'],
@@ -7428,10 +7732,12 @@ class ClaritasForwardModel:
                         light_post,
                         light_event_weight,
                         light_event_count,
+                        light_absorption_count,
                         light_segment_total,
                         light_deposited_total,
                         light_segment_count,
                         light_event_total,
+                        light_absorption_total,
                         light_error_count,
                         light_boundary_adjustment_count,
                         light_event_outside_count,
@@ -8810,6 +9116,13 @@ class ClaritasForwardModel:
             + path_scores['single_coherent_wave_escape']
         )
         path_diag['exact_particle_order_labels'] = ['0', '1', '2', '3', '4', '5+']
+        path_diag['conditional_sampler_counts'] = dict(zip(
+            ['candidate_trials', 'outcome_rejections', 'inaccessible_trials',
+             'accepted_geometric', 'accepted_coherent', 'accepted_morphology',
+             'accepted_absorptions', 'accepted_scatterings', 'numerical_failures', 'retry_exhaustions'],
+            [int(v) for v in cp.asnumpy(conditional_stats)]))
+        path_diag['closure'] = ('Mie extinction and terminal outcomes; conditional finite-particle angular/path law' if conditional_enabled else self.particle_event_model + '; configured unconditional event law')
+        path_diag['conditional_max_trials'] = CONDITIONAL_MAX_TRIALS
         path_diag['exact_particle_order_scores'] = exact_particle_order_scores.copy()
         path_diag['exact_geometric_order_labels'] = ['0', '1', '2', '3', '4', '5+']
         path_diag['exact_geometric_order_scores'] = exact_geometric_order_scores.copy()
@@ -9151,6 +9464,11 @@ class ClaritasForwardModel:
             grid_event_count = cp.asnumpy(light_event_count).reshape(
                 light_nz, light_ny, light_nx
             )
+            grid_absorption_count = cp.asnumpy(light_absorption_count).reshape(light_nz, light_ny, light_nx)
+            absorption_total = int(cp.asnumpy(light_absorption_total)[0])
+            absorption_grid_total = int(np.sum(grid_absorption_count, dtype=np.uint64))
+            if absorption_total != absorption_grid_total:
+                raise CaseIntegrityError('accepted absorption-event deposition does not close')
             tc = cp.asnumpy(light_tcount)[:light_rep]
             to = cp.asnumpy(light_toverflow)[:light_rep]
             th = [
@@ -9188,6 +9506,11 @@ class ClaritasForwardModel:
             light_diag = {
                 'track_length_m': grid_total,
                 'post_scatter_track_length_m': grid_post,
+                'absorption_event_count': grid_absorption_count,
+                'absorption_event_total': absorption_total,
+                'deposited_absorption_event_total': absorption_grid_total,
+                'absorption_event_closure_error': absorption_grid_total - absorption_total,
+                'absorption_grid_basis': 'accepted extinction encounter site; not volumetric absorbed energy',
                 'scatter_event_weight': grid_event_weight,
                 'scatter_event_count': grid_event_count,
                 'nx': light_nx,
@@ -9728,7 +10051,34 @@ def _resolved_geometry():
     }
 
 
-def _resolved_sediment_config():
+def _resolve_material_density(material: str):
+    """Resolve configured true particle density per material; never use a fallback.
+
+    A scalar is retained for compatibility with legacy single-density runs.
+    """
+    material = _validate_material(material)
+    value = SEDIMENT_PARTICLE_DENSITY_KG_M3
+    if isinstance(value, dict):
+        normalized = {str(k).strip().lower(): v for k, v in value.items()}
+        if len(normalized) != len(value):
+            raise ValueError('SEDIMENT_PARTICLE_DENSITY_KG_M3 contains duplicate material keys')
+        unknown = set(normalized) - {'loess', 'kaolin'}
+        if unknown:
+            raise ValueError(f'SEDIMENT_PARTICLE_DENSITY_KG_M3 unknown materials: {sorted(unknown)}')
+        if material not in normalized:
+            raise ValueError(f'SEDIMENT_PARTICLE_DENSITY_KG_M3 missing {material!r} density')
+        value = normalized[material]
+    try:
+        density = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f'SEDIMENT_PARTICLE_DENSITY_KG_M3[{material}] is not numeric: {value!r}') from exc
+    if not (np.isfinite(density) and density > 0):
+        raise ValueError(f'SEDIMENT_PARTICLE_DENSITY_KG_M3[{material}] must be finite and positive: {value!r}')
+    return density
+
+
+def _resolved_sediment_config(material=None):
+    material = _validate_material(MATERIAL if material is None else material)
     distribution = str(SEDIMENT_DISTRIBUTION).strip().lower()
     steady = distribution == 'steady_state'
     model = str(SEDIMENT_TRANSPORT_MODEL).strip().lower() if steady else 'uniform'
@@ -9744,7 +10094,7 @@ def _resolved_sediment_config():
         .strip()
         .lower(),
         'sediment_eddy_diffusivity_m2_s': float(SEDIMENT_EDDY_DIFFUSIVITY_M2_S),
-        'sediment_particle_density_kg_m3': float(SEDIMENT_PARTICLE_DENSITY_KG_M3),
+        'sediment_particle_density_kg_m3': _resolve_material_density(material),
         'water_density_kg_m3': float(WATER_DENSITY_KG_M3),
         'water_dynamic_viscosity_pa_s': float(WATER_DYNAMIC_VISCOSITY_PA_S),
         'gravity_m_s2': float(GRAVITY_M_S2),
@@ -9776,7 +10126,7 @@ def _resolved_light_transport_config():
         'enabled': enabled,
         'save_visualisations': bool(SAVE_LIGHT_TRANSPORT_VISUALISATIONS),
         'save_data': bool(SAVE_LIGHT_TRANSPORT_DATA),
-        'max_rays': int(LIGHT_TRANSPORT_DIAGNOSTIC_MAX_RAYS),
+        'max_rays': (int(N_RAYS) if LIGHT_TRANSPORT_DIAGNOSTIC_MAX_RAYS is None else int(LIGHT_TRANSPORT_DIAGNOSTIC_MAX_RAYS)),
         'nx': int(LIGHT_TRANSPORT_GRID_NX),
         'ny': int(LIGHT_TRANSPORT_GRID_NY),
         'nz': int(LIGHT_TRANSPORT_GRID_NZ),
@@ -9842,9 +10192,9 @@ def _matches_comparison_sediment(d=None):
     return True
 
 
-def _validate_user_configuration():
+def _validate_user_configuration(material=None):
     g = _resolved_geometry()
-    d = _resolved_sediment_config()
+    d = _resolved_sediment_config(material)
     ld = _resolved_light_transport_config()
     if not (
         np.isfinite(g['sample_cell_diameter_m']) and g['sample_cell_diameter_m'] > 0
@@ -11114,9 +11464,9 @@ def _optical_profile_override(material: str):
     return {material: {'n_real': n.tolist(), 'k_imag': k.tolist()}}, n, k
 
 
-def _build_model(material: str, wavelength_nm: float):
+def _resolve_model_kwargs(material: str, wavelength_nm: float):
     profile, nvals, kvals = _optical_profile_override(material)
-    g, d = _validate_user_configuration()
+    g, d = _validate_user_configuration(material)
     kw = dict(MODEL_DEFAULT_KWARGS)
     kw.update(
         n_water=float(WATER_REFRACTIVE_INDEX),
@@ -11163,6 +11513,11 @@ def _build_model(material: str, wavelength_nm: float):
         chunk_size=int(CHUNK_SIZE),
         statistics_batch_rays=int(STATISTICS_BATCH_RAYS),
     )
+    return kw, nvals, kvals
+
+
+def _build_model(material: str, wavelength_nm: float):
+    kw, nvals, kvals = _resolve_model_kwargs(material, wavelength_nm)
     return ReportingClaritasForwardModel(**kw), kw, nvals, kvals
 
 
@@ -11200,6 +11555,12 @@ def _wavelength_assumption_summary(material: str, wavelength_nm: float, nvals, k
         'air_refractive_index': float(AIR_REFRACTIVE_INDEX),
         'particle_n_min': float(np.min(nvals)),
         'particle_n_max': float(np.max(nvals)),
+        'hybrid_absorption_closure_status': (
+            'nonabsorbing particles' if np.all(np.asarray(kvals) == 0)
+            else ('Mie extinction/outcome closure with conditional hybrid paths; angular/amplitude validation not implied' if MODEL_DEFAULT_KWARGS['particle_event_model'] in {'hybrid_mie_exact_rate', 'hybrid_mie_exact_rate_moment_constrained'} else 'configured unconditional event law; integral Mie closure not asserted')
+        ),
+        'conditional_max_trials': CONDITIONAL_MAX_TRIALS,
+        'conditional_boundary_rule': 'geometric placements conditioned on whole-particle accessibility; unsupported outcomes fail explicitly',
         'particle_k_min': float(np.min(kvals)),
         'particle_k_max': float(np.max(kvals)),
         'particle_index_basis': 'fixed size-dependent n(d); no spectral dispersion table',
@@ -11228,6 +11589,8 @@ def _print_wavelength_summary(info):
     print(
         f"    particle k: {info['particle_k_min']:.8g} .. {info['particle_k_max']:.8g}"
     )
+    if info.get('particle_k_max', 0.0) > 0.0:
+        print('    NOTE: Mie extinction/outcome closure conditions hybrid particle paths; angular distributions and apparatus amplitudes require separate validation.')
     if abs(float(info['wavelength_nm']) - 622.0) > 1e-12:
         print(
             '    NOTE: has no refractive-index dispersion tables; n(d), water n and acrylic n are being reused across wavelength.'
@@ -11885,6 +12248,7 @@ def _write_light_transport_outputs_checked(out: Path, diag, g, d, cfg, context=N
             post_scatter_track_length_weighted_m=diag['post_scatter_track_length_m'],
             particle_scatter_event_weight=diag['scatter_event_weight'],
             particle_scatter_event_count=diag['scatter_event_count'],
+            particle_absorption_event_count=diag.get('absorption_event_count', np.zeros_like(diag['scatter_event_count'])),
             x_edges_m=np.linspace(
                 diag['x_min_m'], diag['x_max_m'], int(diag['nx']) + 1
             ),
@@ -11919,6 +12283,10 @@ def _write_light_transport_outputs_checked(out: Path, diag, g, d, cfg, context=N
         'diagnostic_memory_bytes': int(diag['diagnostic_memory_bytes']),
         'diagnostic_active_wall_time_s': float(diag['diagnostic_active_wall_time_s']),
         'segment_count': int(diag['segment_count']),
+        'absorption_event_total': int(diag.get('absorption_event_total', 0)),
+        'deposited_absorption_event_total': int(diag.get('deposited_absorption_event_total', 0)),
+        'absorption_event_closure_error': int(diag.get('absorption_event_closure_error', 0)),
+        'absorption_grid_basis': diag.get('absorption_grid_basis'),
         'scatter_event_total': int(diag['scatter_event_total']),
         'deposited_scatter_event_total': int(diag['deposited_scatter_event_total']),
         'scatter_event_closure_error': int(diag['scatter_event_closure_error']),
@@ -12298,6 +12666,9 @@ def _write_detector_outputs(
         for a in (score, norm, native, mirror)
     ):
         raise CaseIntegrityError('nonfinite or negative production detector field')
+    order_scores = np.asarray(res.detector_particle_path_diagnostics['exact_particle_order_scores'])
+    if order_scores.shape != (6, len(score)) or not np.allclose(order_scores.sum(axis=0), score, rtol=1e-12, atol=1e-8):
+        raise CaseIntegrityError('particle interaction-order detector partition does not close')
     rows = []
     for i, angle in enumerate(DETECTOR_ANGLES_DEG):
         rows.append(
@@ -12309,6 +12680,9 @@ def _write_detector_outputs(
                 'n_rays': int(res.n_rays),
                 'angle_deg': float(angle),
                 'absolute_score': float(score[i]),
+                'particle_uninteracted_score': float(res.detector_particle_path_diagnostics['exact_particle_order_scores'][0, i]),
+                'particle_interacted_score': float(np.sum(res.detector_particle_path_diagnostics['exact_particle_order_scores'][1:, i])),
+                'absolute_score_per_launched_ray': float(score[i] / res.n_rays),
                 'normalized_score': float(norm[i]),
                 'native_hit_count': int(native[i]),
                 'mirror_hit_count': int(mirror[i]),
@@ -12492,7 +12866,7 @@ def _summary_dict(
     mu_abs = max(mu_ext - mu_sca, 0.0)
     albedo = mu_sca / mu_ext if mu_ext > 0 else None
     g = _resolved_geometry()
-    d = _resolved_sediment_config()
+    d = _resolved_sediment_config(material)
     zmean = g['water_level_m'] - g['sensor_ring_height_m']
     vg = vortex_surface_geometry(
         d['free_surface_model'],
@@ -12587,6 +12961,8 @@ def _summary_dict(
             else None
         ),
         'particle_event_model': res.particle_event_model,
+        'conditional_outcome_closure': res.detector_particle_path_diagnostics.get('closure'),
+        'conditional_sampler_counts': res.detector_particle_path_diagnostics.get('conditional_sampler_counts'),
         'particle_surface_rms_slope_deg': float(res.particle_surface_rms_slope_deg),
         'wave_surface_rms_height_nm': float(res.wave_surface_rms_height_nm),
         'wavelength_assumptions': wl_info,
@@ -12615,7 +12991,7 @@ def run_one_case(
     _print_wavelength_summary(wl_info)
 
     g = _resolved_geometry()
-    d = _resolved_sediment_config()
+    d = _resolved_sediment_config(material)
     light_cfg = _resolved_light_transport_config()
     config = {
         'claritas_source_sha256': _current_source_sha256(),
@@ -13089,7 +13465,10 @@ def _aggregate_sweep_plots(
 
 def main():
     policy = _resolved_failure_policy()
-    g, d = _validate_user_configuration()  # host-side validation before CUDA is touched
+    selected_materials = MATERIALS if RUN_SWEEP else [MATERIAL]
+    for selected_material in selected_materials:
+        _validate_user_configuration(selected_material)
+    g, d = _validate_user_configuration(selected_materials[0])  # pre-CUDA validation
     geometry_baseline = _matches_comparison_geometry(g)
     sediment_baseline = _matches_comparison_sediment(d)
     cp, gpu_name = _require_cuda_and_select_device()
